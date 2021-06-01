@@ -22,7 +22,6 @@ func init() {
 	})
 }
 
-
 const languageCN = "CN"
 
 const (
@@ -61,7 +60,7 @@ func (ipline *IPLine) checkDomainExisted(domain string) bool {
 func (ipline *IPLine) getLineSetting(domain, ip string) string {
 	domain = MakeDomainCanonical(domain)
 	ipline.logger.Info(fmt.Sprintf("domain:%v, ip:%v", domain, ip))
-	res,err := ipline.dnspowerRedis.HGet(ipline.ctx, domain, ip).Result()
+	res, err := ipline.dnspowerRedis.HGet(ipline.ctx, domain, ip).Result()
 	if err != nil {
 		ipline.logger.Error(fmt.Errorf("hget ip line failed:%w", err).Error())
 		return ""
@@ -105,11 +104,12 @@ func New(conf *config.Config) middleware.Handler {
 
 	ipData, err := ipdb.NewCity(conf.IpDataPath)
 	if err != nil {
-		panic(fmt.Errorf("open ipdb %v failed:%w",conf.IpDataPath, err))
+		panic(fmt.Errorf("open ipdb %v failed:%w", conf.IpDataPath, err))
 	}
 
 	digSvc := new(dnsutil.Dig)
-	if err := digSvc.At(conf.DnspowerBackendAddr);err != nil {
+	logger.Info(fmt.Sprintf("dnsbaackend:%v", conf.DnspowerBackendAddr))
+	if err := digSvc.At(conf.DnspowerBackendAddr); err != nil {
 		panic(fmt.Errorf("at dig svc failed:%w", err))
 	}
 
@@ -118,11 +118,11 @@ func New(conf *config.Config) middleware.Handler {
 	})
 
 	ipline := &IPLine{
-		logger:   logger,
-		authAddr: conf.DnspowerBackendAddr,
-		ipData:   ipData,
-		digSvc:   new(dnsutil.Dig),
-		ctx:      context.Background(),
+		logger:        logger,
+		authAddr:      conf.DnspowerBackendAddr,
+		ipData:        ipData,
+		digSvc:        digSvc,
+		ctx:           context.Background(),
 		dnspowerRedis: redisDB,
 	}
 	logger.Info("new ipline succeed")
@@ -140,8 +140,8 @@ func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 	ipline.logger.Info("qs.name", qs.Name)
 
 	if qs.Qtype == dns.TypeA && ipline.checkDomainExisted(qs.Name) {
-	    incomeIP := ch.Writer.RemoteIP().String()
-	    incomeIsp := ipline.IPIspDomain(incomeIP)
+		incomeIP := ch.Writer.RemoteIP().String()
+		incomeIsp := ipline.IPIspDomain(incomeIP)
 
 		ips, err := ipline.resolveDomain(qs.Name)
 		if err != nil {
@@ -154,28 +154,25 @@ func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 		msg.Authoritative, msg.RecursionAvailable = true, false
 
 		header := dns.RR_Header{
-			Name: qs.Name,
+			Name:   qs.Name,
 			Rrtype: dns.TypeA,
-			Class: dns.ClassINET,
+			Class:  dns.ClassINET,
+			Ttl: 3600,
 		}
 
-		retIPs := make([]string, 0, len(ips))
 		for _, ip := range ips {
-		    ansIPIsp := ipline.getLineSetting(qs.Name, ip)
-		    if ansIPIsp == IPLineDefault {
-		    	retIPs = append(retIPs, ip)
-			} else if ansIPIsp == incomeIsp {
-				retIPs = append(retIPs, ip)
+			ansIPIsp := ipline.getLineSetting(qs.Name, ip)
+			if ansIPIsp == IPLineDefault || ansIPIsp == incomeIsp {
+				msg.Answer = append(msg.Answer, &dns.A{Hdr: header, A: net.IP(ip)})
+				break
 			}
-			msg.Answer = append(msg.Answer, &dns.A{Hdr: header, A: net.IP(ip)})
 		}
-
-		_ = wtr.WriteMsg(msg)
-
+		if err := wtr.WriteMsg(msg);err != nil {
+			ipline.logger.Error(err.Error())
+		}
 		ch.Cancel()
-	} else {
-		ch.Next(ctx)
 	}
+	ch.Next(ctx)
 }
 
 func MakeDomainCanonical(name string) string {
