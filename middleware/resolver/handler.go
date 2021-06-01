@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -49,6 +50,7 @@ func (h *DNSHandler) Name() string { return name }
 
 // ServeDNS implements the Handle interface.
 func (h *DNSHandler) ServeDNS(ctx context.Context, ch *middleware.Chain) {
+	fmt.Println("aaa")
 	w, req := ch.Writer, ch.Request
 
 	if v := ctx.Value(ctxKey("reqid")); v == nil {

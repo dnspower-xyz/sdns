@@ -19,40 +19,43 @@ const configver = "1.1.0"
 
 // Config type
 type Config struct {
-	Version         string
-	BlockLists      []string
-	BlockListDir    string
-	RootServers     []string
-	Root6Servers    []string
-	RootKeys        []string
-	FallbackServers []string
-	AccessList      []string
-	LogLevel        string
-	AccessLog       string
-	Bind            string
-	BindTLS         string
-	BindDOH         string
-	TLSCertificate  string
-	TLSPrivateKey   string
-	API             string
-	Nullroute       string
-	Nullroutev6     string
-	Hostsfile       string
-	OutboundIPs     []string
-	OutboundIP6s    []string
-	Timeout         Duration
-	Expire          uint32
-	CacheSize       int
-	Maxdepth        int
-	RateLimit       int
-	ClientRateLimit int
-	CookieSecret    string
-	NSID            string
-	Blocklist       []string
-	Whitelist       []string
-	Chaos           bool
-	QnameMinLevel   int `toml:"qname_min_level"`
-	EmptyZones      []string
+	Version                  string
+	BlockLists               []string
+	BlockListDir             string
+	RootServers              []string
+	Root6Servers             []string
+	RootKeys                 []string
+	FallbackServers          []string
+	AccessList               []string
+	LogLevel                 string
+	AccessLog                string
+	Bind                     string
+	BindTLS                  string
+	BindDOH                  string
+	TLSCertificate           string
+	TLSPrivateKey            string
+	API                      string
+	Nullroute                string
+	Nullroutev6              string
+	Hostsfile                string
+	OutboundIPs              []string
+	OutboundIP6s             []string
+	Timeout                  Duration
+	Expire                   uint32
+	CacheSize                int
+	Maxdepth                 int
+	RateLimit                int
+	ClientRateLimit          int
+	CookieSecret             string
+	NSID                     string
+	Blocklist                []string
+	Whitelist                []string
+	Chaos                    bool
+	QnameMinLevel            int `toml:"qname_min_level"`
+	EmptyZones               []string
+	DnspowerBackendAddr      string `toml:"dnspower_backend_addr"`
+	DnspowerBackendRedisAddr string `toml:"dnspower_backend_redis_addr"`
+	IpDataPath               string `toml:"ip_data_path"`
 
 	Plugins map[string]Plugin
 

@@ -38,3 +38,8 @@ tidy:
 clean:
 	rm -rf $(BIN)
 	rm -rf generated.go
+
+.PHONY: start
+start:
+	go build
+	./sdns
