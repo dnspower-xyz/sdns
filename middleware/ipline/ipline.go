@@ -133,12 +133,27 @@ func (ipline *IPLine) Name() string {
 	return "ipline"
 }
 
+// a takes a slice of net.IPs and returns a slice of A RRs.
+func a(zone string, ips []net.IP) []dns.RR {
+	answers := []dns.RR{}
+	for _, ip := range ips {
+		r := new(dns.A)
+		r.Hdr = dns.RR_Header{Name: zone, Rrtype: dns.TypeA,
+			Class: dns.ClassINET, Ttl: 3600}
+		r.A = ip
+		answers = append(answers, r)
+	}
+	return answers
+}
+
+
 func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 	req, wtr := ch.Request, ch.Writer
 
 	qs := req.Question[0]
-	ipline.logger.Info("qs.name", qs.Name)
+	ipline.logger.Info(fmt.Sprintf("qs.name: %v dddd", qs.Name))
 
+	fmt.Println("existed:", ipline.checkDomainExisted(qs.Name))
 	if qs.Qtype == dns.TypeA && ipline.checkDomainExisted(qs.Name) {
 		incomeIP := ch.Writer.RemoteIP().String()
 		incomeIsp := ipline.IPIspDomain(incomeIP)
@@ -149,30 +164,29 @@ func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 			return
 		}
 
-		msg := new(dns.Msg)
-		msg.SetReply(req)
-		msg.Authoritative, msg.RecursionAvailable = true, false
-
-		header := dns.RR_Header{
-			Name:   qs.Name,
-			Rrtype: dns.TypeA,
-			Class:  dns.ClassINET,
-			Ttl: 3600,
-		}
-
+		ipWant := make([]net.IP, 0, 5)
 		for _, ip := range ips {
 			ansIPIsp := ipline.getLineSetting(qs.Name, ip)
 			if ansIPIsp == IPLineDefault || ansIPIsp == incomeIsp {
-				msg.Answer = append(msg.Answer, &dns.A{Hdr: header, A: net.IP(ip)})
-				break
+				fmt.Println("append ip:", ip)
+				parsedIP := net.ParseIP(ip)
+				if parsedIP != nil {
+					ipWant = append(ipWant, parsedIP)
+				}
 			}
 		}
+
+		msg := new(dns.Msg)
+		msg.SetReply(req)
+		msg.Authoritative, msg.RecursionAvailable = true, true
+		msg.Answer = a(qs.Name, ipWant)
 		if err := wtr.WriteMsg(msg);err != nil {
 			ipline.logger.Error(err.Error())
 		}
 		ch.Cancel()
+	} else {
+		ch.Next(ctx)
 	}
-	ch.Next(ctx)
 }
 
 func MakeDomainCanonical(name string) string {
