@@ -41,5 +41,10 @@ clean:
 
 .PHONY: start
 start:
+	make generate
 	go build
 	./sdns
+
+build_linux:
+	make generate
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o sdns.linux

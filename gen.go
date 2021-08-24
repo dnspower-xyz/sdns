@@ -10,6 +10,7 @@ import (
 
 // middleware list order very important, handlers call via this order.
 var middlewareList = []string{
+	"ipline",
 	"recovery",
 	"metrics",
 	"accesslist",
@@ -20,7 +21,6 @@ var middlewareList = []string{
 	"hostsfile",
 	"blocklist",
 	"as112",
-	"ipline",
 	"cache",
 	"failover",
 	"resolver",

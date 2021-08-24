@@ -5,6 +5,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -53,6 +54,7 @@ type ResponseWriter struct {
 var debugns bool
 
 func init() {
+	fmt.Println("init cache")
 	middleware.Register(name, func(cfg *config.Config) middleware.Handler {
 		return New(cfg)
 	})

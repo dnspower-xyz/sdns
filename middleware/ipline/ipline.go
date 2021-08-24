@@ -4,19 +4,19 @@ import (
 	"context"
 	"fmt"
 	"github.com/go-redis/redis/v8"
-	"github.com/ipipdotnet/ipdb-go"
+	"github.com/lionsoul2014/ip2region/binding/golang/ip2region"
 	"github.com/lixiangzhong/dnsutil"
 	"github.com/miekg/dns"
 	"github.com/semihalev/log"
 	"github.com/semihalev/sdns/config"
 	"github.com/semihalev/sdns/middleware"
 	"gorm.io/gorm"
-	"net"
 	"strings"
 	"sync"
 )
 
 func init() {
+	fmt.Println("init ipline")
 	middleware.Register("ipline", func(cfg *config.Config) middleware.Handler {
 		return New(cfg)
 	})
@@ -30,6 +30,7 @@ const (
 	IPLineUni     = "联通"
 	IPLineTele    = "电信"
 	IPLineForg    = "海外"
+	IPLineEdu     = "教育网"
 )
 
 type ModelDomain struct {
@@ -41,7 +42,7 @@ type IPLine struct {
 	logger        log.Logger
 	authAddr      string
 	dnspowerRedis *redis.Client
-	ipData        *ipdb.City
+	ip2Region     *ip2region.Ip2Region
 	rw            sync.RWMutex
 	digSvc        *dnsutil.Dig
 	ctx           context.Context
@@ -57,7 +58,7 @@ func (ipline *IPLine) checkDomainExisted(domain string) bool {
 	return res == 1
 }
 
-func (ipline *IPLine) getLineSetting(domain, ip string) string {
+func (ipline *IPLine) GetLineSettingFromRedis(domain, ip string) string {
 	domain = MakeDomainCanonical(domain)
 	ipline.logger.Info(fmt.Sprintf("domain:%v, ip:%v", domain, ip))
 	res, err := ipline.dnspowerRedis.HGet(ipline.ctx, domain, ip).Result()
@@ -68,44 +69,46 @@ func (ipline *IPLine) getLineSetting(domain, ip string) string {
 	return res
 }
 
-func (ipline *IPLine) resolveDomain(domain string) ([]string, error) {
+func (ipline *IPLine) resolveDomain(domain string) ([]*dns.A, error) {
 	a, err := ipline.digSvc.A(domain)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dig A record failed:%w", err)
 	}
-	ips := make([]string, 0, len(a))
-	for _, ip := range a {
-		ips = append(ips, ip.A.String())
-	}
-	return ips, nil
+	return a, err
 }
 
-func (ipline *IPLine) IPIspDomain(ip string) string {
-	info, err := ipline.ipData.FindInfo(ip, languageCN)
+func (ipline *IPLine) QueryIPISP(ip string) (string, error) {
+	region, err := ipline.ip2Region.BtreeSearch(ip)
 	if err != nil {
-		ipline.logger.Error("find ip info failed", err)
-		return ""
+		return "", err
 	}
-	return info.IspDomain
-}
-
-func (ipline *IPLine) IsChinaIP(ip string) bool {
-	info, err := ipline.ipData.FindInfo(ip, languageCN)
-	if err != nil {
-		ipline.logger.Error("find ip info failed", err)
-		return false
+	country := region.Country
+	province := region.Province
+	isp := region.ISP
+	if !strings.Contains(country, "中国") {
+		return IPLineForg, nil
 	}
-	return info.CountryName == "中国"
+	if strings.Contains(province, "香港") || strings.Contains(province, "澳门") || strings.Contains(province, "台湾") {
+		return IPLineForg, nil
+	}
+	if strings.Contains(isp, IPLineTele) {
+		return IPLineTele, nil
+	}
+	if strings.Contains(isp, IPLineUni) {
+		return IPLineUni, nil
+	}
+	if strings.Contains(isp, IPLineMbi) {
+		return IPLineMbi, nil
+	}
+	if strings.Contains(isp, IPLineEdu) {
+		return IPLineEdu, nil
+	}
+	return "", fmt.Errorf("unknown isp info:%v", isp)
 }
 
 func New(conf *config.Config) middleware.Handler {
 	logger := log.New("middleware", "ipline")
 	logger.Info("new ipline...")
-
-	ipData, err := ipdb.NewCity(conf.IpDataPath)
-	if err != nil {
-		panic(fmt.Errorf("open ipdb %v failed:%w", conf.IpDataPath, err))
-	}
 
 	digSvc := new(dnsutil.Dig)
 	logger.Info(fmt.Sprintf("dnsbaackend:%v", conf.DnspowerBackendAddr))
@@ -114,13 +117,23 @@ func New(conf *config.Config) middleware.Handler {
 	}
 
 	redisDB := redis.NewClient(&redis.Options{
-		Addr: conf.DnspowerBackendRedisAddr,
+		Addr:     conf.DnspowerBackendRedisAddr,
+		Password: conf.DnspowerBackendRedisPass,
 	})
+
+	if err := redisDB.Ping(context.Background()).Err(); err != nil {
+		panic(fmt.Errorf("ping dns backend redis failed:%w", err))
+	}
+
+	ip2Region, err := ip2region.New(conf.IpDataPath)
+	if err != nil {
+		panic(fmt.Errorf("open ip data path failed:%w", err))
+	}
 
 	ipline := &IPLine{
 		logger:        logger,
 		authAddr:      conf.DnspowerBackendAddr,
-		ipData:        ipData,
+		ip2Region:     ip2Region,
 		digSvc:        digSvc,
 		ctx:           context.Background(),
 		dnspowerRedis: redisDB,
@@ -134,53 +147,114 @@ func (ipline *IPLine) Name() string {
 }
 
 // a takes a slice of net.IPs and returns a slice of A RRs.
-func a(zone string, ips []net.IP) []dns.RR {
+func a(zone string, ips []*dns.A) []dns.RR {
 	answers := []dns.RR{}
 	for _, ip := range ips {
 		r := new(dns.A)
 		r.Hdr = dns.RR_Header{Name: zone, Rrtype: dns.TypeA,
-			Class: dns.ClassINET, Ttl: 3600}
-		r.A = ip
+			Class: dns.ClassINET, Ttl: ip.Hdr.Ttl}
+		r.A = ip.A
 		answers = append(answers, r)
 	}
 	return answers
 }
 
+func cname(zone string, vals []*dns.CNAME) []dns.RR {
+	ans := []dns.RR{}
+	for _, val := range vals {
+		r := new(dns.CNAME)
+		r.Hdr = dns.RR_Header{
+			Name: zone, Rrtype: dns.TypeA,
+			Class: dns.ClassINET, Ttl: val.Hdr.Ttl}
+		r.Target = val.Target
+		ans = append(ans, r)
+	}
+	return ans
+}
+
+func (ipline *IPLine) isSupportLineMode(tp uint16) bool {
+	return tp == dns.TypeA || tp == dns.TypeCNAME
+}
 
 func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 	req, wtr := ch.Request, ch.Writer
 
 	qs := req.Question[0]
-	ipline.logger.Info(fmt.Sprintf("qs.name: %v dddd", qs.Name))
+	ipline.logger.Info(fmt.Sprintf("qs.name: %v", qs.Name))
 
-	fmt.Println("existed:", ipline.checkDomainExisted(qs.Name))
-	if qs.Qtype == dns.TypeA && ipline.checkDomainExisted(qs.Name) {
-		incomeIP := ch.Writer.RemoteIP().String()
-		incomeIsp := ipline.IPIspDomain(incomeIP)
-
-		ips, err := ipline.resolveDomain(qs.Name)
+	fmt.Println("existed:", ipline.checkDomainExisted(qs.Name), qs.Qtype)
+	if ipline.isSupportLineMode(qs.Qtype) && ipline.checkDomainExisted(qs.Name) {
+		incomeIP := wtr.RemoteIP().String()
+		incomeISP, err := ipline.QueryIPISP(incomeIP)
 		if err != nil {
-			ipline.logger.Error("resolve domain failed", err)
-			return
+			ipline.logger.Error(fmt.Errorf("query ip %v isp failed:%w", incomeIP, err).Error())
 		}
 
-		ipWant := make([]net.IP, 0, 5)
-		for _, ip := range ips {
-			ansIPIsp := ipline.getLineSetting(qs.Name, ip)
-			if ansIPIsp == IPLineDefault || ansIPIsp == incomeIsp {
-				fmt.Println("append ip:", ip)
-				parsedIP := net.ParseIP(ip)
-				if parsedIP != nil {
-					ipWant = append(ipWant, parsedIP)
-				}
+		rrListQuery := make([]dns.RR, 0, 10)
+		rrListRet := make([]dns.RR, 0, 10)
+
+		switch qs.Qtype {
+		case dns.TypeA:
+			aList, err := ipline.digSvc.A(qs.Name)
+			if err != nil {
+				ipline.logger.Error(fmt.Errorf("dig cname %v failed:%w", qs.Name, err).Error())
+				return
+			}
+			for _, a := range aList {
+				rrListQuery = append(rrListQuery, a)
+			}
+		case dns.TypeCNAME:
+			cList, err := ipline.digSvc.CNAME(qs.Name)
+			if err != nil {
+				ipline.logger.Error(fmt.Errorf("dig cname %v failed:%w", qs.Name, err).Error())
+				return
+			}
+			for _, c := range cList {
+				rrListQuery = append(rrListQuery, c)
+			}
+		default:
+			ipline.logger.Error(fmt.Errorf("unsupported dns type %v", qs.Qtype).Error())
+		}
+
+		defaultRetRR := make([]dns.RR, 0, 5)
+		lineMatched := false
+
+		for _, r := range rrListQuery {
+		    var recordLine string
+		    var val string
+			switch r.(type) {
+			case *dns.A:
+				val = r.(*dns.A).A.String()
+				recordLine = ipline.GetLineSettingFromRedis(qs.Name, val)
+			case *dns.CNAME:
+				val = r.(*dns.CNAME).Target
+				recordLine = ipline.GetLineSettingFromRedis(qs.Name, val)
+			}
+			if recordLine == "" {
+				ipline.logger.Error(fmt.Sprintf("can't get line if of record val %v from redis", val))
+				continue
+			}
+			ipline.logger.Info(fmt.Sprintf("record val %v(%v), income ip %v(%v)",
+				val, recordLine, incomeIP, incomeISP))
+			if recordLine == IPLineDefault {
+				defaultRetRR = append(defaultRetRR, r)
+			}
+			if recordLine == incomeISP {
+				lineMatched = true
+				rrListRet = append(rrListRet, r)
 			}
 		}
 
+		if !lineMatched && len(rrListRet) == 0 {
+			rrListRet = append(rrListRet, defaultRetRR...)
+			ipline.logger.Info(fmt.Sprintf("%s unmatched any line setting, return %v default ips",
+				qs.Name, len(defaultRetRR)))
+		}
 		msg := new(dns.Msg)
 		msg.SetReply(req)
 		msg.Authoritative, msg.RecursionAvailable = true, true
-		msg.Answer = a(qs.Name, ipWant)
-		if err := wtr.WriteMsg(msg);err != nil {
+		msg.Answer = rrListRet
+		if err := wtr.WriteMsg(msg); err != nil {
 			ipline.logger.Error(err.Error())
 		}
 		ch.Cancel()
@@ -188,6 +262,7 @@ func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 		ch.Next(ctx)
 	}
 }
+
 
 func MakeDomainCanonical(name string) string {
 	if strings.HasSuffix(name, ".") {

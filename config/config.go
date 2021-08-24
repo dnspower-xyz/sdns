@@ -55,6 +55,7 @@ type Config struct {
 	EmptyZones               []string
 	DnspowerBackendAddr      string `toml:"dnspower_backend_addr"`
 	DnspowerBackendRedisAddr string `toml:"dnspower_backend_redis_addr"`
+	DnspowerBackendRedisPass string `toml:"dnspower_backend_redis_pass"`
 	IpDataPath               string `toml:"ip_data_path"`
 
 	Plugins map[string]Plugin
