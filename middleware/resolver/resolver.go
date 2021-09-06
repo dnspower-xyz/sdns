@@ -1403,6 +1403,7 @@ func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp
 	}
 
 	keys := make(map[uint16]*dns.DNSKEY)
+	fmt.Println(msg.Answer)
 	for _, a := range msg.Answer {
 		if a.Header().Rrtype == dns.TypeDNSKEY {
 			dnskey := a.(*dns.DNSKEY)

@@ -11,12 +11,33 @@ import (
 	"github.com/semihalev/sdns/config"
 	"github.com/semihalev/sdns/middleware"
 	"gorm.io/gorm"
+	"net"
 	"strings"
 	"sync"
 )
 
+var privateIPBlocks []*net.IPNet
+
 func init() {
 	fmt.Println("init ipline")
+
+	for _, cidr := range []string{
+		"127.0.0.0/8",    // IPv4 loopback
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+		"169.254.0.0/16", // RFC3927 link-local
+		"::1/128",        // IPv6 loopback
+		"fe80::/10",      // IPv6 link-local
+		"fc00::/7",       // IPv6 unique local addr
+	} {
+		_, block, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(fmt.Errorf("parse error on %q: %v", cidr, err))
+		}
+		privateIPBlocks = append(privateIPBlocks, block)
+	}
+
 	middleware.Register("ipline", func(cfg *config.Config) middleware.Handler {
 		return New(cfg)
 	})
@@ -48,14 +69,31 @@ type IPLine struct {
 	ctx           context.Context
 }
 
-func (ipline *IPLine) checkDomainExisted(domain string) bool {
+func (ipline *IPLine) checkDomainExisted(domain string) (string, bool) {
 	domain = MakeDomainCanonical(domain)
 	res, err := ipline.dnspowerRedis.Exists(ipline.ctx, domain).Result()
-	if err != nil {
-		ipline.logger.Error("query domain existed in redis failed", err)
-		return false
+	if err != nil && err != redis.Nil {
+		ipline.logger.Error(fmt.Errorf("query whether %v existed in redis failed:%w", domain, err).Error())
+		return "", false
 	}
-	return res == 1
+
+	if res == 1 {
+		return domain, true
+	}
+
+	elems := strings.Split(domain, ".")
+	checkKey := MakeDomainCanonical(domain)
+	if len(elems) == 3 {
+		checkKey = fmt.Sprintf("@.%v.", domain)
+	} else if len(elems) == 4 {
+		checkKey = fmt.Sprintf("*.%v.%v.", elems[1], elems[2])
+	}
+	res, err = ipline.dnspowerRedis.Exists(ipline.ctx, checkKey).Result()
+	if err != nil && err != redis.Nil {
+		ipline.logger.Error(fmt.Sprintf("query whether %v existed in redis failed", checkKey))
+		return "", false
+	}
+	return checkKey, res == 1
 }
 
 func (ipline *IPLine) GetLineSettingFromRedis(domain, ip string) string {
@@ -78,6 +116,9 @@ func (ipline *IPLine) resolveDomain(domain string) ([]*dns.A, error) {
 }
 
 func (ipline *IPLine) QueryIPISP(ip string) (string, error) {
+	if ip == "127.0.0.1" {
+		return IPLineDefault, nil
+	}
 	region, err := ipline.ip2Region.BtreeSearch(ip)
 	if err != nil {
 		return "", err
@@ -173,82 +214,90 @@ func cname(zone string, vals []*dns.CNAME) []dns.RR {
 }
 
 func (ipline *IPLine) isSupportLineMode(tp uint16) bool {
-	return tp == dns.TypeA || tp == dns.TypeCNAME
+	return tp == dns.TypeA
 }
+
+func isPrivateIP(rawIP string) bool {
+	ip := net.ParseIP(rawIP)
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+
+	for _, block := range privateIPBlocks {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 
 func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 	req, wtr := ch.Request, ch.Writer
 
 	qs := req.Question[0]
-	ipline.logger.Info(fmt.Sprintf("qs.name: %v", qs.Name))
 
-	fmt.Println("existed:", ipline.checkDomainExisted(qs.Name), qs.Qtype)
-	if ipline.isSupportLineMode(qs.Qtype) && ipline.checkDomainExisted(qs.Name) {
-		incomeIP := wtr.RemoteIP().String()
-		incomeISP, err := ipline.QueryIPISP(incomeIP)
+	if isPrivateIP(wtr.RemoteIP().String()) {
+		ch.Next(ctx)
+		return
+	}
+
+	checkKey, existed := ipline.checkDomainExisted(qs.Name)
+	if !existed {
+		ch.CancelWithRcode(dns.RcodeRefused, false)
+		return
+	}
+
+	if qs.Qtype == dns.TypeA {
+		incomeip := wtr.RemoteIP().String()
+		incomeLine, err := ipline.QueryIPISP(incomeip)
 		if err != nil {
-			ipline.logger.Error(fmt.Errorf("query ip %v isp failed:%w", incomeIP, err).Error())
+			ipline.logger.Error(fmt.Errorf("query ip %v line failed:%w", incomeip, err).Error())
+			ch.CancelWithRcode(dns.RcodeServerFailure, false)
+			return
 		}
 
-		rrListQuery := make([]dns.RR, 0, 10)
-		rrListRet := make([]dns.RR, 0, 10)
-
-		switch qs.Qtype {
-		case dns.TypeA:
-			aList, err := ipline.digSvc.A(qs.Name)
-			if err != nil {
-				ipline.logger.Error(fmt.Errorf("dig cname %v failed:%w", qs.Name, err).Error())
-				return
-			}
-			for _, a := range aList {
-				rrListQuery = append(rrListQuery, a)
-			}
-		case dns.TypeCNAME:
-			cList, err := ipline.digSvc.CNAME(qs.Name)
-			if err != nil {
-				ipline.logger.Error(fmt.Errorf("dig cname %v failed:%w", qs.Name, err).Error())
-				return
-			}
-			for _, c := range cList {
-				rrListQuery = append(rrListQuery, c)
-			}
-		default:
-			ipline.logger.Error(fmt.Errorf("unsupported dns type %v", qs.Qtype).Error())
+		pdnsMsg := dnsutil.NewMsg(dns.TypeA, qs.Name)
+		pdnsRsp, err := ipline.digSvc.Exchange(pdnsMsg)
+		if err != nil {
+			ipline.logger.Error(fmt.Errorf("exchage dns msg with domain %v failed:%w", qs.Name, err).Error())
+			ch.CancelWithRcode(dns.RcodeNameError, false)
+			return
 		}
 
 		defaultRetRR := make([]dns.RR, 0, 5)
+		rrListRet := make([]dns.RR, 0, 10)
 		lineMatched := false
 
-		for _, r := range rrListQuery {
-		    var recordLine string
-		    var val string
-			switch r.(type) {
-			case *dns.A:
-				val = r.(*dns.A).A.String()
-				recordLine = ipline.GetLineSettingFromRedis(qs.Name, val)
-			case *dns.CNAME:
-				val = r.(*dns.CNAME).Target
-				recordLine = ipline.GetLineSettingFromRedis(qs.Name, val)
+		for _, ans := range pdnsRsp.Answer {
+			var val string
+			switch ans.Header().Rrtype {
+			case dns.TypeA:
+				val = ans.(*dns.A).A.String()
+			case dns.TypeCNAME:
+				val = ans.(*dns.CNAME).Target
+			case dns.TypeNS:
+				val = ans.(*dns.NS).Ns
+			case dns.TypeTXT:
+				val = ans.(*dns.TXT).Txt[0]
 			}
+			recordLine := ipline.GetLineSettingFromRedis(checkKey, val)
+			ipline.logger.Info(fmt.Sprintf("iter pdns ans...type:%v val:%v line:%v", ans.Header().Rrtype, val, recordLine))
 			if recordLine == "" {
-				ipline.logger.Error(fmt.Sprintf("can't get line if of record val %v from redis", val))
-				continue
+				ipline.logger.Error(fmt.Errorf("can't get record line from redis failed").Error())
+				ch.CancelWithRcode(dns.RcodeServerFailure, false)
+				return
 			}
-			ipline.logger.Info(fmt.Sprintf("record val %v(%v), income ip %v(%v)",
-				val, recordLine, incomeIP, incomeISP))
 			if recordLine == IPLineDefault {
-				defaultRetRR = append(defaultRetRR, r)
+				defaultRetRR = append(defaultRetRR, ans)
 			}
-			if recordLine == incomeISP {
+			if recordLine == incomeLine {
 				lineMatched = true
-				rrListRet = append(rrListRet, r)
+				rrListRet = append(rrListRet, ans)
 			}
 		}
-
 		if !lineMatched && len(rrListRet) == 0 {
 			rrListRet = append(rrListRet, defaultRetRR...)
-			ipline.logger.Info(fmt.Sprintf("%s unmatched any line setting, return %v default ips",
-				qs.Name, len(defaultRetRR)))
 		}
 		msg := new(dns.Msg)
 		msg.SetReply(req)
@@ -258,11 +307,23 @@ func (ipline *IPLine) ServeDNS(ctx context.Context, ch *middleware.Chain) {
 			ipline.logger.Error(err.Error())
 		}
 		ch.Cancel()
+	} else if qs.Qtype == dns.TypeNS {
+		msg := dnsutil.NewMsg(dns.TypeNS, qs.Name)
+		rsp, err := ipline.digSvc.Exchange(msg)
+		if err != nil {
+			ipline.logger.Error(fmt.Errorf("exchage ns msg with domain %v failed:%w", qs.Name, err).Error())
+			ch.CancelWithRcode(dns.RcodeNameError, false)
+			return
+		}
+		rsp.SetReply(req)
+		if err := wtr.WriteMsg(rsp); err != nil {
+			ipline.logger.Error(err.Error())
+		}
+		ch.Cancel()
 	} else {
 		ch.Next(ctx)
 	}
 }
-
 
 func MakeDomainCanonical(name string) string {
 	if strings.HasSuffix(name, ".") {
